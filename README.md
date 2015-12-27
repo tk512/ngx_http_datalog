@@ -19,16 +19,26 @@ Note the pattern match group in datalog_filter. In this case, it would match
       $ sqlite3 /var/db/nginx-datalog.sqlite
       SQLite version 3.8.11.1 2015-07-29 20:00:57
       Enter ".help" for usage hints.
+
       sqlite> .schema
       CREATE TABLE datalog (
         TIMESTAMP DATETIME DEFAULT(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')), 
-        app_id TEXT NOT NULL, 
+        identifier TEXT NOT NULL, 
         username TEXT NOT NULL, 
         filter_matched TEXT NOT NULL, 
         request_bytes INT NOT NULL, 
         response_bytes INT NOT NULL);
-      sqlite> select * from datalog limit 1;
-      2015-11-21 14:52:43.950|d7ec81b8-4877-d0d2-3a2b-f9ed41d612b6|b712838e-2423-4b6d-904e-f508533743b5|/api/v1/application_instance|518|290
-      sqlite>
 
-Future: datalog_filter should be a regex 
+      With a match group defined:
+
+      sqlite> select * from datalog;
+      2015-12-27 13:42:17.414|cbca9571-372b-41e7-a663-e170d750f479|my-username|192|1292
+      2015-12-27 13:42:25.120|cbca9571-372b-41e7-9999-e170d750f479|my-username|192|1292
+      2015-12-27 13:43:21.238|cbca9571-372b-41e7-9999-e170d750f479|my-username|176|1292
+        
+      Without a match group defined:
+      sqlite> select * from datalog;
+      2015-12-27 13:39:07.936|^/api/v1/app/.*$|my-username|192|1292
+      2015-12-27 13:39:24.700|^/api/v1/app/.*$|my-username|192|1292
+      2015-12-27 13:39:34.035|^/api/v1/app/.*$|my-username|192|1292
+
