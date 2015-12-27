@@ -3,6 +3,10 @@ Nginx module for flexible data usage logging
 
 An nginx module that monitors data usage (bytes sent/recv) and saves
 to a SQLite3 database on the filesystem.
+
+The idea is that one configures datalog for a server block, with a filter
+which is a regular expression. If one is interested in a part of the URL to be
+an **identifier** of sorts, it can be defined using a match group as shown below.
  
 Configuration from within an nginx server context may look like this:
 
@@ -11,9 +15,10 @@ Configuration from within an nginx server context may look like this:
       datalog_db                      /var/db/nginx-datalog.sqlite;
 
 # Filter
-Note the pattern match group in datalog_filter. In this case, it would match
- URI's such as /api/v2/app/ee9f904c-b82d-446d-b6b4-6f76d8331136/sync and use the
- respective UUID as the identifier in the datalog database. 
+Note the pattern match group in datalog_filter. 
+
+In this case, it would match URI's such as /api/v2/app/ee9f904c-b82d-446d-b6b4-6f76d8331136/sync 
+and use the respective UUID as the identifier in the datalog database. 
 
 # Example of accessing the SQLite3 database
       $ sqlite3 /var/db/nginx-datalog.sqlite
@@ -37,6 +42,7 @@ Note the pattern match group in datalog_filter. In this case, it would match
       2015-12-27 13:43:21.238|cbca9571-372b-41e7-9999-e170d750f479|my-username|176|1292
         
       Without a match group defined:
+
       sqlite> select * from datalog;
       2015-12-27 13:39:07.936|^/api/v1/app/.*$|my-username|192|1292
       2015-12-27 13:39:24.700|^/api/v1/app/.*$|my-username|192|1292
