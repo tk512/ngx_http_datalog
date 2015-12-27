@@ -8,8 +8,12 @@
  * Configuration from within an nginx server context may look like this:
  *
  *      datalog                         on;
- *      datalog_filter                  /api/v1/application_instance;
+ *      datalog_filter                  ^/api/v2/app/(.*)/sync$
  *      datalog_db                      /var/db/nginx-datalog.sqlite;
+ *
+ * Note the pattern match group in datalog_filter. In this case, it would match
+ * URI's such as /api/v2/app/ee9f904c-b82d-446d-b6b4-6f76d8331136/sync and use the
+ * respective UUID as the identifier in the datalog database.
  *
  */
 #include <ngx_config.h>
@@ -19,22 +23,26 @@
 #include <stdlib.h>
 #include <sqlite3.h>
 
-static const char NGX_HTTP_DATALOG_INSERT[] = 
-    "INSERT INTO datalog (app_id,username,filter_matched,request_bytes,response_bytes)";
+// Configuration struct
+typedef struct {
+    ngx_flag_t           enable;
+    ngx_str_t            pattern;
+    ngx_regex_t         *filter_regex;
+    int                  filter_regex_captures; 
+    ngx_str_t            db;
+} ngx_http_datalog_conf_t;
 
+static int ngx_http_datalog_extract_identifier(ngx_http_request_t *r, 
+                                               ngx_http_datalog_conf_t *conf,
+                                               ngx_str_t *identifier);
+static ngx_int_t ngx_http_datalog_handler(ngx_http_request_t *r);
 static void * ngx_http_datalog_create_conf(ngx_conf_t *cf);
 static char * ngx_http_datalog_merge_conf(ngx_conf_t *cf, void *parent, void *child);
 static char * ngx_http_datalog_filter(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static char * ngx_http_datalog_extract_path_param(ngx_pool_t *pool, ngx_str_t *uri, 
-                                                  ngx_uint_t param_idx);
-static ngx_int_t ngx_http_datalog_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_datalog_init(ngx_conf_t *cf);
 
-typedef struct {
-    ngx_flag_t           enable;
-    ngx_str_t             filter;
-    ngx_str_t            db;
-} ngx_http_datalog_conf_t;
+static const char NGX_HTTP_DATALOG_INSERT[] = 
+    "INSERT INTO datalog (identifier,username,request_bytes,response_bytes)";
 
 static ngx_command_t  ngx_http_datalog_commands[] = {
 
@@ -94,23 +102,39 @@ ngx_module_t  ngx_http_datalog_module = {
 };
 
 
-/*
- * Extract a path parameter from the URI requested
- */
-static char* ngx_http_datalog_extract_path_param(ngx_pool_t *pool, ngx_str_t *uri, ngx_uint_t param_idx) {
-    char *param = NULL;
-    char *copy = (char*) ngx_pstrdup(pool, uri);
-    ngx_uint_t i;
+static int ngx_http_datalog_extract_identifier(ngx_http_request_t *r, 
+                                               ngx_http_datalog_conf_t *conf,
+                                               ngx_str_t *identifier)
+{
+    int rc;
+    ngx_int_t n = (conf->filter_regex_captures + 1) * 3;
 
-    // Isolate path parameter
-    for(i = 0; i <= param_idx; i++) {
-        param = strsep(&copy, "/");
-        if(param == NULL) {
-            break;
-        }
+    int *captures = ngx_palloc(r->pool, n * sizeof(int));
+    if(captures == NULL) {
+        return NGX_ERROR;
     }
 
-    return param;
+    rc = ngx_regex_exec(conf->filter_regex, &r->uri, captures, n);
+    if(rc < NGX_REGEX_NO_MATCHED) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, ngx_regex_exec_n 
+                      " failed: %i on \"%V\"", rc, &r->uri);
+        return NGX_ERROR;
+
+    } else if (rc == NGX_REGEX_NO_MATCHED) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, ngx_regex_exec_n 
+                       " no datalog matches on \"%V\"", &r->uri);
+        return NGX_ERROR;
+    } 
+    
+    // Isolate identifier matched from the datalog_filter regex
+    identifier->len = captures[3] - captures[2];
+    identifier->data = ngx_pnalloc(r->pool, identifier->len + 1);
+
+    ngx_cpystrn(identifier->data, r->uri.data + captures[2], identifier->len + 1);
+
+    identifier->data[identifier->len] = '\0';
+    
+    return NGX_OK;
 }
 
 /*
@@ -121,7 +145,7 @@ static ngx_int_t ngx_http_datalog_handler(ngx_http_request_t *r)
 {
     ngx_http_datalog_conf_t *conf = ngx_http_get_module_srv_conf(r, ngx_http_datalog_module);
     ngx_str_t username;
-   
+
     if(conf->enable == 0) {
         return NGX_OK;
     } 
@@ -134,111 +158,114 @@ static ngx_int_t ngx_http_datalog_handler(ngx_http_request_t *r)
     username.data = ngx_pnalloc(r->pool, username.len + 1);
     ngx_cpystrn(username.data, r->headers_in.user.data, username.len + 1);
 
-    // Rudimentary match of uri against datalog_filter before I implement regex support
-    if (conf->filter.len <= r->uri.len 
-        && ngx_strncmp(r->uri.data, conf->filter.data, conf->filter.len) == 0) {
-       
-        sqlite3 *conn;
-        sqlite3_stmt *stmt;
-        int ret;
-        
-        // Make sure database is open
-        ret = sqlite3_open((char *)conf->db.data, &conn); 
-        if (ret == SQLITE_ERROR) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
-                "sqlite3_open() could not open %s: %s", conf->db.data, sqlite3_errmsg(conn));
-            sqlite3_close(conn);
-            return NGX_ERROR;
-        }
+    if (conf->filter_regex == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, "datalog_filter regex could not be found");
+        return NGX_ERROR;
+    }
+   
+    ngx_str_t identifier;
+    if(ngx_http_datalog_extract_identifier(r, conf, &identifier) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
-        // Check if datalog table already exists
-        ret = sqlite3_prepare_v2(conn, "pragma table_info(datalog)", -1, &stmt, NULL);
+    // If no pattern group used, just use the pattern as the identifier
+    if(conf->filter_regex_captures == 0) {
+        identifier = conf->pattern;
+    }
+
+    sqlite3 *conn;
+    sqlite3_stmt *stmt;
+    int ret;
+    
+    // Make sure database is open
+    ret = sqlite3_open((char *)conf->db.data, &conn); 
+    if (ret == SQLITE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
+            "sqlite3_open() could not open %s: %s", conf->db.data, sqlite3_errmsg(conn));
+        sqlite3_close(conn);
+        return NGX_ERROR;
+    }
+
+    // Check if datalog table already exists
+    ret = sqlite3_prepare_v2(conn, "pragma table_info(datalog)", -1, &stmt, NULL);
+    if (ret != SQLITE_OK) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
+            "sqlite3_prepare_v2() could not execute query to check for datalog table: %s", sqlite3_errmsg(conn));
+        sqlite3_close(conn);
+        return NGX_ERROR;
+    }
+
+    ret = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (ret != SQLITE_ROW) {
+        ret = sqlite3_exec(conn, 
+            "CREATE TABLE IF NOT EXISTS datalog (" 
+            "  timestamp          DATETIME DEFAULT(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')), " 
+            "  identifier         TEXT NOT NULL, " 
+            "  username           TEXT NOT NULL, "
+            "  request_bytes      INT NOT NULL, "
+            "  response_bytes     INT NOT NULL)", NULL, 0, 0);
+
         if (ret != SQLITE_OK) {
             ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
-                "sqlite3_prepare_v2() could not execute query to check for datalog table: %s", sqlite3_errmsg(conn));
+                "sqlite3_exec() could not execute query to create datalog table: %s", sqlite3_errmsg(conn));
             sqlite3_close(conn);
             return NGX_ERROR;
         }
-
-        ret = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        if (ret != SQLITE_ROW) {
-            ret = sqlite3_exec(conn, 
-                "CREATE TABLE IF NOT EXISTS datalog (" 
-                "TIMESTAMP DATETIME DEFAULT(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')), " 
-                "app_id TEXT NOT NULL, " 
-                "username TEXT NOT NULL, "
-                "filter_matched TEXT NOT NULL, "
-                "request_bytes INT NOT NULL, "
-                "response_bytes INT NOT NULL)", NULL, 0, 0);
-
-            if (ret != SQLITE_OK) {
-                ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
-                    "sqlite3_exec() could not execute query to create datalog table: %s", sqlite3_errmsg(conn));
-                sqlite3_close(conn);
-                return NGX_ERROR;
-            }
-        }
-
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
-            "datalog handler filter: %s", conf->filter.data);
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
-            "datalog handler db: %s", conf->db.data);
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
-            "datalog handler username: %s", username.data);
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
-            "datalog handler bytes: %Ob sent / %Ob received ", r->connection->sent, r->request_length);
-
-        char *app_id = ngx_http_datalog_extract_path_param(r->pool, &r->uri, 4);
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "datalog handler app ID: %s", app_id);
-
-        ngx_str_t sql;
-        sql.len = sizeof(NGX_HTTP_DATALOG_INSERT) - 1
-                  + sizeof(" VALUES ('") - 1
-                  + ngx_strlen(app_id)
-                  + sizeof(",'") - 1
-                  + username.len 
-                  + sizeof("','") - 1 
-                  + conf->filter.len
-                  + sizeof("',") - 1
-                  + snprintf(NULL, 0, "%zu", r->request_length) // String length of request length
-                  + sizeof(",") - 1
-                  + snprintf(NULL, 0, "%zu", r->connection->sent) // String length of sent bytes
-                  + sizeof(")") - 1
-                  + 1;
-        sql.data = ngx_pnalloc(r->pool, sql.len);
-        if(sql.data == NULL) {
-            return NGX_ERROR;
-        }
-
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "datalog handler sql length: %l", sql.len);
-        ngx_snprintf(sql.data, sql.len, "%s VALUES ('%s','%s','%s',%l,%l)", 
-            NGX_HTTP_DATALOG_INSERT, 
-            app_id, 
-            username.data,
-            conf->filter.data,
-            r->request_length,
-            r->connection->sent
-        );
-        sql.data[sql.len] = '\0';
-
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "datalog handler SQL: %s", sql.data);
-
-        // Insert row to datalog table: 
-        // I've observed during benchmark testing that the database may lock. Possibly a sqlite3 bug.
-        // Workaround is to just execute the statement again. This happens extremely rarely.
-        ret = sqlite3_exec(conn, (char*)sql.data, NULL, 0, 0);
-        if (ret == SQLITE_LOCKED) {
-            ngx_msleep(100);
-            ret = sqlite3_exec(conn, (char*)sql.data, NULL, 0, 0);
-        }
-        if (ret != SQLITE_OK && ret != SQLITE_LOCKED) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
-                "sqlite3_exec() could not insert to datalog table: %s", sqlite3_errmsg(conn));
-        }
-
-        sqlite3_close(conn);
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
+        "datalog handler db: %s", conf->db.data);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
+        "datalog handler identifier: %s", identifier.data);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
+        "datalog handler username: %s", username.data);
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
+        "datalog handler bytes: %Ob sent / %Ob received ", r->connection->sent, r->request_length);
+
+    ngx_str_t sql;
+    sql.len = sizeof(NGX_HTTP_DATALOG_INSERT) - 1
+              + sizeof(" VALUES ('") - 1
+              + identifier.len
+              + sizeof(",'") - 1
+              + username.len 
+              + sizeof("',") - 1
+              + snprintf(NULL, 0, "%lld", r->request_length) // String length of request length
+              + sizeof(",") - 1
+              + snprintf(NULL, 0, "%lld", r->connection->sent) // String length of sent bytes
+              + sizeof(")") - 1
+              + 1;
+    sql.data = ngx_pnalloc(r->pool, sql.len);
+    if(sql.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "datalog handler sql length: %l", sql.len);
+    ngx_snprintf(sql.data, sql.len, "%s VALUES ('%s','%s',%l,%l)", 
+        NGX_HTTP_DATALOG_INSERT, 
+        identifier.data,
+        username.data,
+        r->request_length,
+        r->connection->sent
+    );
+    sql.data[sql.len] = '\0';
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "datalog handler SQL: %s", sql.data);
+
+    // Insert row to datalog table: 
+    //  I've observed during benchmark testing that the database may lock. Possibly a sqlite3 bug.
+    //  Workaround is to just execute the statement again. This happens extremely rarely.
+    ret = sqlite3_exec(conn, (char*)sql.data, NULL, 0, 0);
+    if (ret == SQLITE_LOCKED) {
+        ngx_msleep(100);
+        ret = sqlite3_exec(conn, (char*)sql.data, NULL, 0, 0);
+    }
+    if (ret != SQLITE_OK && ret != SQLITE_LOCKED) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0, 
+            "sqlite3_exec() could not insert to datalog table: %s", sqlite3_errmsg(conn));
+    }
+
+    sqlite3_close(conn);
 
     return NGX_OK;
 }
@@ -290,7 +317,11 @@ ngx_http_datalog_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_datalog_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
-    ngx_conf_merge_str_value(conf->filter, prev->filter, NULL);
+    
+    if(conf->filter_regex == NULL) {
+        conf->filter_regex = prev->filter_regex;
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -299,15 +330,47 @@ ngx_http_datalog_merge_conf(ngx_conf_t *cf, void *parent, void *child)
  */
 static char * ngx_http_datalog_filter(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) 
 {
+    #ifndef NGX_PCRE
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "datalog_filter requires the PCRE library");
+    return NGX_CONF_ERROR;
+    #endif
+
     ngx_http_datalog_conf_t *dlcf = conf;
     ngx_uint_t i;
 
     ngx_str_t *value = cf->args->elts;
-    
+   
     for (i = 1; i < cf->args->nelts; i++) {
-            dlcf->filter.data = value[i].data;
-            dlcf->filter.len = value[i].len;
-            break; // Only support single filtering directive for now
+            // First argument to datalog_filter. 
+            // Right now we only support a single match from regexp.
+            if(i == 1) {
+                u_char               errstr[NGX_MAX_CONF_ERRSTR];
+                ngx_regex_compile_t  rc;
+
+                ngx_memzero(&rc, sizeof(ngx_regex_compile_t));
+
+                rc.pattern  = value[i];
+                rc.pool     = cf->pool;
+                rc.err.len  = NGX_MAX_CONF_ERRSTR;
+                rc.err.data = errstr;
+
+                if(ngx_regex_compile(&rc) != NGX_OK) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, 
+                        "datalog_filter pattern \"%V\" is not valid", &rc.pattern);
+                    return NGX_CONF_ERROR; 
+                }
+                
+                if(rc.captures > 1) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, 
+                        "datalog_filter pattern \"%V\" cannot have more than 1 capture", &rc.pattern);
+                    return NGX_CONF_ERROR; 
+                }
+
+                dlcf->filter_regex = rc.regex;
+                dlcf->filter_regex_captures = rc.captures;
+
+                dlcf->pattern = value[i];
+            } 
     }
 
     return NGX_CONF_OK;
