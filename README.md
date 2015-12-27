@@ -10,9 +10,13 @@ an **identifier** of sorts, it can be defined using a match group as shown below
  
 Configuration from within an nginx server context may look like this:
 
+    server {
+      server_name                     .mydomain.com;
+      listen                          80;
       datalog                         on;
       datalog_filter                  ^/api/v2/app/(.*)/sync$
       datalog_db                      /var/db/nginx-datalog.sqlite;
+    }
 
 # Filter
 Note the pattern match group in datalog_filter. 
@@ -44,7 +48,7 @@ and use the respective UUID as the identifier in the datalog database.
       Without a match group defined:
 
       sqlite> select * from datalog;
-      2015-12-27 13:39:07.936|^/api/v1/app/.*$|my-username|192|1292
-      2015-12-27 13:39:24.700|^/api/v1/app/.*$|my-username|192|1292
-      2015-12-27 13:39:34.035|^/api/v1/app/.*$|my-username|192|1292
+      2015-12-27 13:39:07.936|^/api/v2/app/.*$|my-username|192|1292
+      2015-12-27 13:39:24.700|^/api/v2/app/.*$|my-username|192|1292
+      2015-12-27 13:39:34.035|^/api/v2/app/.*$|my-username|192|1292
 
