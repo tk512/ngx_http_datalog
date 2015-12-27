@@ -7,9 +7,13 @@ to a SQLite3 database on the filesystem.
 Configuration from within an nginx server context may look like this:
 
       datalog                         on;
-      datalog_filter                  /api/v1/application_instance;
+      datalog_filter                  ^/api/v2/app/(.*)/sync$
       datalog_db                      /var/db/nginx-datalog.sqlite;
- 
+
+# Filter
+Note the pattern match group in datalog_filter. In this case, it would match
+ URI's such as /api/v2/app/ee9f904c-b82d-446d-b6b4-6f76d8331136/sync and use the
+ respective UUID as the identifier in the datalog database. 
 
 # Example of accessing the SQLite3 database
       $ sqlite3 /var/db/nginx-datalog.sqlite
